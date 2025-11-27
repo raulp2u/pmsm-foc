@@ -1,2 +1,2 @@
 # pmsm-foc
-not yet done
+it spins but something feels off
