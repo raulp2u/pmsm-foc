@@ -23,21 +23,33 @@
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
 #include <math.h>
+#include "stm32g4xx_ll_dma.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct {
+    // Coeficientes (A Receita do Filtro)
+    float b0, b1, b2; // Pesos da Entrada
+    float a1, a2;     // Pesos da Saída (Feedback)
+
+    // Memória (O Histórico)
+    float x1, x2; // Entradas passadas (Ontem, Anteontem)
+    float y1, y2; // Saídas passadas (Ontem, Anteontem)
+} EstruturaFiltro;
+
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SQRT3_DIV_3 0.57735027f  // 1 / sqrt(3)
-#define SQRT3_DIV_2 0.86602540f  // sqrt(3) / 2
-#define TWO_DIV_3   0.66666667f  // 2 / 3
+#define SQRT3_DIV_3 0.57735027f  // 	1 / sqrt(3)
+#define SQRT3_DIV_2 0.86602540f  // 	sqrt(3) / 2
+#define TWO_DIV_3   0.66666667f  // 	2 / 3
 #define PI 3.14159265f
 #define TWO_PI 6.2831853f
-// limites do integrador (exemplos)
+
 #define SERROW_MAX  10.0f
 #define SERROW_MIN -10.0f
 #define SERRQ_MAX   10.0f
@@ -45,17 +57,25 @@
 #define SERRD_MAX   10.0f
 #define SERRD_MIN  -10.0f
 
+#define R 0.138f
+#define L 0.0001f
+#define Fs 10000.0f
+#define Ts (1 / Fs)
 
+#define CCM_VAR  __attribute__((section(".ccmram")))
+#define CCM_FUNC __attribute__((section(".ccmram.text")))
 
-#define R_PHASE 0.2f
-#define L_PHASE 0.2f
+// --- Ganhos do PLL (Observador de Ângulo) ---
 
-#define F_PWM 42457.5f
-#define Fs (F_PWM / 10.0f)
-#define Ts (1.0f / Fs)
+// KP: "Rigidez" do rastreamento. Define quão rápido o PLL reage a um erro de ângulo.
+// Valor muito baixo: Motor perde sincronismo se acelerar rápido.
+// Valor muito alto: O ângulo oscila e faz barulho.
+#define PLL_KP  150.0f
 
-#define BEMF_FILTER_ALPHA 0.02f
-#define CURRENT_FILTER_ALPHA 0.25f
+// KI: "Memória" da velocidade. Ajuda a travar na velocidade correta.
+// Geralmente segue a relação de amortecimento crítico: Ki = (Kp^2) / 4
+// Para Kp=250 -> Ki ~= 15625. Mas em FOC costuma-se usar um pouco mais alto.
+#define PLL_KI  60000.0f
 
 /* USER CODE END PD */
 
@@ -80,32 +100,37 @@ OPAMP_HandleTypeDef hopamp2;
 TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
-uint16_t adc1_buffer[2];
-uint16_t adc2_buffer[4];
+uint16_t adc1_buffer[1];
+uint16_t adc2_buffer[2];
 
 volatile int flagdadosprontos=0;
-volatile int opamp1selector=0;
-volatile int opamp2selector=0;
-volatile int itcounter=0;
 
 volatile uint16_t offset_iu_raw_op2=0;
 volatile uint16_t offset_iv_raw=0;
 volatile uint16_t offset_iw_raw=0;
 volatile uint16_t offset_iu_raw_op1=0;
+
 volatile int observador = 0;
-volatile float iu=0;
-volatile float iv=0;
-volatile float iw=0;
+// Structs dos Filtros (COLOQUE NA CCMRAM)
+CCM_VAR EstruturaFiltro filtro_iv;
+CCM_VAR EstruturaFiltro filtro_iw;
+
+// Variáveis de Cálculo (Pode colocar na CCMRAM também)
+CCM_VAR float iv, iw, iu, vbus;
+
+
 volatile float vu=0;
 volatile float vv=0;
 volatile float vw=0;
-volatile float vbus=0;
+
 
 volatile uint16_t iu_raw;
 volatile uint16_t iu_raw_op1;
 volatile uint16_t iu_raw_op2;
 volatile uint16_t iv_raw;
 volatile uint16_t iw_raw;
+volatile float iv_raw_filtrada;
+volatile float iw_raw_filtrada;
 volatile uint16_t vu_raw;
 volatile uint16_t vv_raw;
 volatile uint16_t vw_raw;
@@ -128,6 +153,7 @@ volatile float id=0;
 
 volatile float ia_filtrada = 0.0f;
 volatile float ib_filtrada = 0.0f;
+
 volatile float erroiq=0;
 volatile float erroid=0;
 volatile float serroiq=0;
@@ -151,6 +177,7 @@ volatile float deb=0;
 
 volatile float iach=0;
 volatile float diach=0;
+
 volatile float each=0;
 volatile float deach=0;
 volatile float erroia=0;
@@ -159,6 +186,7 @@ volatile float ibch=0;
 volatile float dibch=0;
 volatile float ebch=0;
 volatile float debch=0;
+
 volatile float erroib=0;
 
 volatile float vdref=0;
@@ -177,18 +205,12 @@ volatile float theta=0;
 volatile float dtheta=0;
 volatile float thetach=0;
 
-float pll_kp = 20.0f; // Ganho Proporcional do PLL (Sintonizável)
-float pll_ki = 2000.0f; // Ganho Integral do PLL (Sintonizável)
-float pll_angle_error_integral = 0.0f; // Integrador do PI do PLL
-float pll_estimated_w = 0.0f;     // (w) Velocidade estimada pelo PLL
-float pll_estimated_theta = 0.0f; // (theta) Ângulo estimado pelo PLL
-
-float smo_z_alpha = 0.0f;     // BEMF Alfa estimado (Saída do SMO)
-float smo_z_beta = 0.0f;      // BEMF Beta estimado (Saída do SMO)
-float smo_ia_est = 0.0f;    // Corrente Alfa estimada (Interna do SMO)
-float smo_ib_est = 0.0f;    // Corrente Beta estimada (Interna do SMO)
-float smo_gain = 200.0f;    // Ganho do SMO (Sintonizável, ex: 200.0f)
-
+// Ganhos do Filtro (Ajuste Fino)
+// Sugestão inicial: Alpha entre 0.05 e 0.2.
+float ALPHA = 0.01f;
+// Beta geralmente segue a relação: Beta ~= Alpha^2 / (2 - Alpha)
+// Para Alpha = 0.1, Beta ~= 0.005
+float BETA = 0.0001f;
 
 //ganhos chutados
 
@@ -203,8 +225,25 @@ volatile float kiq = 0.05f;
 volatile float kpd = 0.1f;
 volatile float kid = 0.05f;
 
-float L_GAIN_1 = 20;
-float L_GAIN_2 = 10;
+
+// Estados do Filtro Alpha-Beta
+float i_alpha_est = 0.0f, di_alpha_est = 0.0f;
+float i_beta_est = 0.0f,  di_beta_est  = 0.0f;
+
+// Estados do PLL
+float pll_theta = 0.0f;
+float pll_omega = 0.0f;
+float pll_integrator = 0.0f;
+
+// Saídas Finais para o FOC
+float theta_foc = 0.0f;    // Ângulo para usar em Park/InvPark
+float rpm_foc = 0.0f;      // Velocidade para controle
+
+// Inputs e Outputs do ciclo anterior (Necessário para BEMF)
+float valpha_prev = 0.0f;
+float vbeta_prev = 0.0f;
+
+ float32_t sin_foc, cos_foc;
 
 
 /* USER CODE END PV */
@@ -221,11 +260,15 @@ static void MX_ADC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_DAC1_Init(void);
 /* USER CODE BEGIN PFP */
+CCM_FUNC void Fast_Loop(void);
+ void Inicializar_Filtros(void);
+CCM_FUNC float Processar_Filtro(EstruturaFiltro *f, float entrada);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 
 /* USER CODE END 0 */
 
@@ -267,373 +310,395 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_DAC1_Init();
   /* USER CODE BEGIN 2 */
-  	TIM1->CCR1 = 0;
-    TIM1->CCR2 = 0;
-    TIM1->CCR3 = 0;
-    TIM1->CCR4 = 900;
-
-    HAL_TIM_Base_Start(&htim1);
+  TIM1->CCR1 = 0;
+  TIM1->CCR2 = 0;
+  TIM1->CCR3 = 0;
 
 
-    // 4. PREPARAR O ADC
-     HAL_OPAMP_Start(&hopamp1);
-     HAL_Delay(100);
-     HAL_OPAMP_Start(&hopamp2);
-     HAL_Delay(100);
 
-     // 5. CALIBRAR O ADC (DEVE VIR ANTES DO START_DMA)
-     HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
-     HAL_Delay(100);
-     HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
-     HAL_Delay(100);
+  HAL_TIM_Base_Start(&htim1);
 
-     HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_4);
-     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+  // 1. PREPARAR OS OPAMPS
+  // (Têm um pequeno tempo de inicialização, T_SU_OPAMP)
+  if (HAL_OPAMP_Start(&hopamp1) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  if (HAL_OPAMP_Start(&hopamp2) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  // Espere 1ms. T_SU_OPAMP é geralmente < 100us, então 1ms é muito seguro.
+  HAL_Delay(1);
 
 
-     for (int calibrando= 0; calibrando < (1<<4); calibrando++){
+  // 2. CALIBRAR OS ADCS
+  // Esta função é BLOQUEANTE (já espera a calibração terminar).
+  // O HAL_Delay(100) original era desnecessário.
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+      Error_Handler();
+  }
+   HAL_ADC_Start_DMA(&hadc1, adc1_buffer, 1);
+   HAL_ADC_Start_DMA(&hadc2, adc2_buffer, 2);
 
-    	 while(flagdadosprontos==0){}
+   TIM1->CCR4=(TIM1->ARR)*0.95;
 
-   		  offset_iu_raw_op1= offset_iu_raw_op1 + iu_raw_op1;
-   		  offset_iu_raw_op2= offset_iu_raw_op2 + iu_raw_op2;
-   		  offset_iv_raw= offset_iv_raw + iv_raw;
-   		  offset_iw_raw= offset_iw_raw + iw_raw;
+   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 
-   		  flagdadosprontos=0;
+   // 6. LOOP DE CALIBRAÇÃO DE OFFSET (MAIS ROBUSTO)
 
-	}
+   // Ajuste de Amostras:
+   // 4096 a 10kHz = ~0.4 segundos (Já é EXCELENTE para média)
+   // 8192 a 10kHz = ~0.8 segundos (Extremamente estável)
+   #define OFFSET_CAL_SAMPLES 8192
 
-     offset_iu_raw_op1= offset_iu_raw_op1/(1<<4);
-     offset_iu_raw_op2= offset_iu_raw_op2/(1<<4);
-     offset_iv_raw= offset_iv_raw/(1<<4);
-     offset_iw_raw= offset_iw_raw/(1<<4);
+   // Timeout:
+   // Deve ser maior que o tempo esperado.
+   // 8192 * 0.0001s = 819ms. Vamos dar 2000ms de folga.
+   #define OFFSET_CAL_TIMEOUT_MS 2000
+
+   uint32_t cal_start_tick;
+
+   // Acumuladores de 64 bits (Essencial para não estourar)
+   uint64_t temp_offset_iv = 0;
+   uint64_t temp_offset_iw = 0;
+
+   // Garante que o flag comece zerado
+   flagdadosprontos = 0;
+
+   // Pega o tempo inicial
+   cal_start_tick = HAL_GetTick();
+
+   for (int i = 0; i < OFFSET_CAL_SAMPLES; i++)
+   {
+       // Espera a interrupção do ADC setar o flag (ex: virar 1 ou 2)
+       // Nota: Adicionei 'volatile' na declaração da flag lá no topo do seu código? É importante.
+       while (flagdadosprontos == 0)
+       {
+           // Verifica se o tempo TOTAL excedeu o limite
+           if ((HAL_GetTick() - cal_start_tick) > OFFSET_CAL_TIMEOUT_MS)
+           {
+               // Se entrou aqui: O ADC parou ou a amostragem é mais lenta do que pensávamos.
+               Error_Handler();
+           }
+       }
+
+       // Limpa o flag para esperar a próxima
+       // (Se sua ISR incrementa até 2, talvez seja melhor: flagdadosprontos--)
+       flagdadosprontos = 0;
+
+       // Acumula
+       temp_offset_iv += iv_raw;
+       temp_offset_iw += iw_raw;
+
+       // Opcional: Se você usar Watchdog (IWDG), deve dar o "kick" aqui dentro
+       // HAL_IWDG_Refresh(&hiwdg);
+   }
+
+   // Calcula a média final
+   offset_iv_raw = (uint32_t)(temp_offset_iv / OFFSET_CAL_SAMPLES);
+   offset_iw_raw = (uint32_t)(temp_offset_iw / OFFSET_CAL_SAMPLES);
+
+   // Opcional: Resetar as variáveis filtradas iniciais para evitar "pulo" no filtro Alpha-Beta
+   iv = 0.0f; iw = 0.0f; iu = 0.0f;
 
 
-     HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
-     HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);
+// 7. INICIAR DACS (para debug ou setpoints)
+if (HAL_DAC_Start(&hdac1, DAC_CHANNEL_1) != HAL_OK)
+{
+    Error_Handler();
+}
+if (HAL_DAC_Start(&hdac1, DAC_CHANNEL_2) != HAL_OK)
+{
+    Error_Handler();
+}
 
 	 int init = 1;
+
+
+	 Inicializar_Filtros();
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-
-	 if(flagdadosprontos==1){
-
-	__disable_irq();
-
-
-	flagdadosprontos=0;
-
-	iu =  ((float)iu_raw_op1+iu_raw_op2-offset_iu_raw_op2-offset_iu_raw_op1)/2 * (3.3f / 4095.0f) / 0.02f;
-	iv =  ((float)iv_raw - offset_iv_raw) * (3.3f / 4095.0f) / 0.02f;
-	iw =  ((float)iw_raw- offset_iw_raw) * (3.3f / 4095.0f) / 0.02f;
-	vu =  (((float)vu_raw)* (3.3f / 4095.0f)) * 21.6f;
-	vv =  (((float)vv_raw)* (3.3f / 4095.0f)) * 21.6f;
-	vw =  (((float)vw_raw)* (3.3f / 4095.0f)) * 21.6f;
-	vbus =(((float)vbus_raw)* (3.3f / 4095.0f)) * 21.6f;
-	 __enable_irq();
-
-	 //  Medidor de contra-eletromotriz
-	 // --- ETAPA 1: TRANSFORMAÇÃO DE CORRENTE (BRUTA) ---
-	 	 		        		 	ia = (TWO_DIV_3 * iu) - (TWO_DIV_3/2.0f * iv) - (TWO_DIV_3/2.0f * iw);
-	 	 		        		 	ib = SQRT3_DIV_3 * (iv - iw);
-
-	 	 		        		 	// Filtro para os PIs do FOC (o FOC gosta de corrente limpa)
-	 	 		        		 	ia_filtrada = (CURRENT_FILTER_ALPHA * ia) + (1.0f - CURRENT_FILTER_ALPHA) * ia_filtrada;
-	 	 		        		 	ib_filtrada = (CURRENT_FILTER_ALPHA * ib) + (1.0f - CURRENT_FILTER_ALPHA) * ib_filtrada;
-
-	 	 		        		 	// --- ETAPA 2: SLIDING MODE OBSERVER (SMO) ---
-	 	 		        		 	// O SMO estima o BEMF. Ele usa as correntes *brutas* (ia, ib)
-	 	 		        		 	// e as tensões comandadas (va, vb) do *ciclo anterior*.
-
-	 	 		        		 	// Calcule o erro de corrente (Real vs. Modelo)
-	 	 		        		 	float ia_err = smo_ia_est - ia;
-	 	 		        		 	float ib_err = smo_ib_est - ib;
-
-	 	 		        		 	// Função de "sliding" (saturação) para evitar "chattering"
-	 	 		        		 	float sat_limit = 0.4f; // Sintonizável
-	 	 		        		 	float slide_a = (ia_err > sat_limit) ? sat_limit : ((ia_err < -sat_limit) ? -sat_limit : ia_err);
-	 	 		        		 	float slide_b = (ib_err > sat_limit) ? sat_limit : ((ib_err < -sat_limit) ? -sat_limit : ib_err);
-
-	 	 		        		 	// Modelo do motor: di_est/dt = (1/L) * (V - R*i_est - Z)
-	 	 		        		 	// Onde Z (smo_z_alpha) é o BEMF estimado.
-	 	 		        		 	float L_inv = 1.0f / L_PHASE; // 1.0 / 0.2 = 5.0
-
-	 	 		        		 	smo_ia_est = smo_ia_est + Ts * ( L_inv * (va - R_PHASE*smo_ia_est - smo_z_alpha) );
-	 	 		        		 	smo_ib_est = smo_ib_est + Ts * ( L_inv * (vb - R_PHASE*smo_ib_est - smo_z_beta) );
-
-	 	 		        		 	// O SMO "força" o BEMF estimado (Z) a corrigir o erro de corrente
-	 	 		        		 	// dZ/dt = G * slide_signal
-	 	 		        		 	smo_z_alpha = smo_z_alpha + Ts * smo_gain * slide_a;
-	 	 		        		 	smo_z_beta = smo_z_beta + Ts * smo_gain * slide_b;
-
-	 	 		        		 	// 'smo_z_alpha' e 'smo_z_beta' agora contêm o BEMF limpo e estimado
-
-	 	 		        		 	// --- ETAPA 3: OBSERVADOR PLL (Trava no BEMF do SMO) ---
-	 	 		        		 	float32_t sin_pll, cos_pll;
-	 	 		        		 	sin_pll = arm_sin_f32(pll_estimated_theta);
-	 	 		        		 	cos_pll = arm_cos_f32(pll_estimated_theta);
-
-	 	 		        		 	// Erro = BEMF do SMO projetado no ângulo do PLL
-	 	 		        		 	float e_d_error = -smo_z_alpha * sin_pll + smo_z_beta * cos_pll;
-
-	 	 		        		 	// PI do PLL
-	 	 		        		 	pll_angle_error_integral = pll_angle_error_integral + e_d_error * Ts;
-	 	 		        		 	pll_estimated_w = (pll_kp * e_d_error) + (pll_ki * pll_angle_error_integral);
-
-	 	 		        		 	// Integrador do PLL
-	 	 		        		 	pll_estimated_theta = pll_estimated_theta + pll_estimated_w * Ts;
-
-	 	 		        		 	if (pll_estimated_theta > TWO_PI) pll_estimated_theta -= TWO_PI;
-	 	 		        		 	else if (pll_estimated_theta < 0.0f) pll_estimated_theta += TWO_PI;
-
-	 	 		        		 	// --- FIM DO OBSERVADOR ---
-
-
-	 	 // --- INÍCIO DA MÁQUINA DE ESTADOS ---
-
-	 	 if(vbus < 12)
-	 	     {
-	 	         // ESTADO 1: FALHA
-	 	         TIM1->CCR1 = 0;
-	 	         TIM1->CCR2 = 0;
-	 	         TIM1->CCR3 = 0;
-	 	         init = 1;
-	 	         theta = 0;
-	 	         w = 0;
-	 	         serroid=0;
-	 	         serroiq=0;
-	 	         thetach=0;
-	 	         thetavelho=0;
-	 	         serrow=0;
-	 	         observador=0;
-	 	     }
-	 	 else if(vbus > 12 && init == 1)
-	 	      {
-	 	     	 init = 0;
-	 	          // ESTADO 2: ALINHAMENTO
-	 	          HAL_TIM_OC_Stop_IT(&htim1, TIM_CHANNEL_4);
-	 	          va = 0.1*vbus;
-	 	          vb = 0.0f;
-	 	          vu = va;
-	 	          vv = (-0.5f * va);
-	 	          vw = (-0.5f * va);
-
-	 	          // Use 800, como o resto do seu código
-	 	          TIM1->CCR1 = (800 / 2) * (1.0f + (vu / vbus));
-	 	          TIM1->CCR2 = (800 / 2) * (1.0f + (vv / vbus));
-	 	          TIM1->CCR3 = (800 / 2) * (1.0f + (vw / vbus));
-
-	 	          HAL_Delay(2000);
-
-	 	          // --- ZERAR OS ESTADOS DEPOIS DO DELAY ---
-	 	          ia_prev = 0.0f;     // (Não é mais usado pelo observador, mas limpa)
-	 	          ib_prev = 0.0f;
-	 	          ia_filtrada = 0.0f;
-	 	          ib_filtrada = 0.0f;
-	 	          ea_filtrada = 0.0f; // (Não é mais usado)
-	 	          eb_filtrada = 0.0f; // (Não é mais usado)
-
-	 	          // Zera os estados do NOVO PLL
-	 	          pll_angle_error_integral = 0.0f;
-	 	          pll_estimated_w = 0.0f;
-	 	          pll_estimated_theta = 0.0f; // Alinhado com o ângulo 0
-
-	 	          // Zera os estados do NOVO SMO
-	 	          smo_z_alpha = 0.0f;
-	 	          smo_z_beta = 0.0f;
-	 	          smo_ia_est = 0.0f;
-	 	          smo_ib_est = 0.0f;
-
-	 	          // Zera os estados do FOC
-	 	          serrow = 0.0f;
-	 	          serroiq = 0.0f;
-	 	          serroid = 0.0f;
-
-	 	          theta = 0.0f;
-	 	          w = 0.0f;
-	 	          dtheta = 0.0f;
-	 	           // Mude para o ESTADO 3
-	 	          HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_4);
-
-	 	     }
-	 	     else if(vbus > 12 && init != 1 && observador!=2)
-	 	     {
-	 	         // ESTADO 3: RAMPA
-
-	 	    	if(w > 440)
-	 	    		         {
-	 	    		        	 observador=2;
-	 	    		        	 serrow = 0.0f;
-	 	    		        	 serroiq = 0.0f;
-	 	    		        	 serroid = 0.0f;
-	 	    		         }
-
-	 	    		         dtheta = w*Ts;
-	 	    		         theta = theta + dtheta;
-
-	 	    		         if (theta > TWO_PI)
-	 	    		         {
-	 	    		             theta = theta - TWO_PI;
-	 	    		         }
-
-	 	    		         float32_t sin_theta, cos_theta;
-	 	    		         sin_theta = arm_sin_f32(theta);
-	 	    		         cos_theta = arm_cos_f32(theta);
-
-
-	 	    		         arm_inv_park_f32(vd, (vbus/3 + 2*vbus*w/(3*450))*0.5, &va, &vb, sin_theta, cos_theta);
-	 	         vu = va;
-	 	         vv = (-0.5 * va) + (SQRT3_DIV_2 * vb);
-	 	         vw = (-0.5 * va) - (SQRT3_DIV_2 * vb);
-
-	 	         TIM1->CCR1 = (800 / 2) * (1.0f + (vu / vbus));
-	 	         TIM1->CCR2 = (800 / 2) * (1.0f + (vv / vbus));
-	 	         TIM1->CCR3 = (800 / 2) * (1.0f + (vw / vbus));
-	 	        // O DAC agora mostra o ângulo do PLL
-				HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 4095*pll_estimated_theta/TWO_PI );
-				// O DAC 2 mostra a corrente *filtrada*
-				uint32_t dac_corrente = (uint32_t)( 4095*theta/TWO_PI );
-				HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, dac_corrente );
-
-	 	     }
-
-	 	     // ESTADO 4: CONTROLO FOC "SENSORLESS" (MALHA FECHADA)
-	 	     else if(vbus > 12 && init != 1 && observador!=0){ // (observador!=0 cobre o estado 2)
-
-	 	    	 	 	 	 	 float32_t sin_theta, cos_theta;
-
-	 	    	                       // Use o ângulo limpo e compensado do PLL
-	 	    	 	    	          sin_theta = arm_sin_f32(pll_estimated_theta);
-	 	    	 	    	          cos_theta = arm_cos_f32(pll_estimated_theta);
-
-	 	    	 	    	          // Transformada de Park (Mede Id, Iq reais)
-	 	    	 	    	          // (Use a corrente filtrada para o FOC)
-	 	    	 	    	          arm_park_f32(ia_filtrada, ib_filtrada, &id, &iq, sin_theta, cos_theta);
-
-	 	    	 	    	          // BÓNUS: Use a velocidade estimada pelo PLL
-	 	    	                       // É muito mais limpa e não tem ruído de 'dtheta/dt'
-	 	    	 	    	          w = pll_estimated_w;
-
-
-	 	    	          // --- CONTROLO PI DE VELOCIDADE (CASCATA EXTERNA) ---
-
-	 	    	          errow = wref - w; // 'w' agora é o valor correto do PLL
-	 	    	          serrow = serrow + errow*Ts;
-
-	 	    	          // Anti-Windup (para o limite de corrente 'iqref' de 3.0)
-	 	    	          float SERROW_MAX_VAL = 3.0f / kiw; // kiw não pode ser zero
-	 	    	          float SERROW_MIN_VAL = -3.0f / kiw;
-	 	    	          if (serrow > SERROW_MAX_VAL) serrow = SERROW_MAX_VAL;
-	 	    	          else if (serrow < SERROW_MIN_VAL) serrow = SERROW_MIN_VAL;
-
-	 	    	          iqref = kpw*errow + kiw*serrow;
-	 	    	          // Saturação da corrente de referência (Já estava correto)
-	 	    	          if (iqref < -3.0f) { iqref = -3.0f; } else if (iqref > 3.0f) { iqref = 3.0f; }
-
-
-	 	    	          // --- DEFINIÇÃO DO LIMITE DE TENSÃO DINÂMICO ---
-	 	    	          // v_limite = Vbus * (1/sqrt(3))
-	 	    	          float v_limite = vbus * SQRT3_DIV_3; // SQRT3_DIV_3 está definido como 0.577...
-
-
-	 	    	          // --- CONTROLO PI DE CORRENTE Q (CASCATA INTERNA) ---
-	 	    	          erroiq = iqref - iq;
-	 	    	          serroiq = serroiq + erroiq*Ts;
-
-	 	    	          // Anti-Windup (IMPLEMENTAÇÃO DINÂMICA)
-	 	    	          float SERRQ_MAX_VAL = v_limite / kiq; // kiq não pode ser zero
-	 	    	          float SERRQ_MIN_VAL = -v_limite / kiq;
-	 	    	          if (serroiq > SERRQ_MAX_VAL) serroiq = SERRQ_MAX_VAL;
-	 	    	          else if (serroiq < SERRQ_MIN_VAL) serroiq = SERRQ_MIN_VAL;
-
-	 	    	          vq = kpq*erroiq + kiq*serroiq;
-	 	    	          // Saturação da Tensão de Saída
-	 	    	          if (vq > v_limite) vq = v_limite;
-	 	    	          else if (vq < -v_limite) vq = -v_limite;
-
-
-	 	    	          // --- CONTROLO PI DE CORRENTE D (CASCATA INTERNA) ---
-	 	    	          erroid = 0.0f - id; // Referência de Id é 0
-	 	    	          serroid = serroid + erroid*Ts;
-
-	 	    	          // Anti-Windup (IMPLEMENTAÇÃO DINÂMICA E CORREÇÃO DO BUG C&P)
-	 	    	          float SERRD_MAX_VAL = v_limite / kid; // kid não pode ser zero
-	 	    	          float SERRD_MIN_VAL = -v_limite / kid;
-
-	 	    	          // AQUI ESTAVA O SEU BUG: usava 'serroiq' em vez de 'serroid'
-	 	    	          if (serroid > SERRD_MAX_VAL) serroid = SERRD_MAX_VAL;
-	 	    	          else if (serroid < SERRD_MIN_VAL) serroid = SERRD_MIN_VAL;
-
-	 	    	          vd = kpd*erroid + kid*serroid;
-	 	    	          // Saturação da Tensão de Saída
-	 	    	          if (vd > v_limite) vd = v_limite;
-	 	    	          else if (vd < -v_limite) vd = -v_limite;
-
-
-	 	    	          // --- APLICAÇÃO (INVERSA DE PARK & PWM) ---
-	 	    	          // (Usa o sin_theta/cos_theta do PLL calculado no início deste bloco)
-	 	    	          arm_inv_park_f32(vd, vq, &va, &vb, sin_theta, cos_theta);
-
-	 	    	          vu = va;
-	 	    	          vv = (-0.5 * va) + (SQRT3_DIV_2 * vb);
-	 	    	          vw = (-0.5 * va) - (SQRT3_DIV_2 * vb);
-
-	 	    	          TIM1->CCR1 = (800 / 2) * (1.0f + (vu / vbus));
-	 	    	          TIM1->CCR2 = (800 / 2) * (1.0f + (vv / vbus));
-	 	    	          TIM1->CCR3 = (800 / 2) * (1.0f + (vw / vbus));
-
-	 	    	         // O DAC agora mostra o ângulo do PLL
-	 	    	          HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 4095*pll_estimated_theta/TWO_PI );
-							// O DAC 2 mostra a corrente *filtrada*
-							uint32_t dac_corrente = (uint32_t)( 4095*theta/TWO_PI );
-							HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, dac_corrente );
-
-
-	     	 }
-
-	     }
-	 }
-
-
-
-
-//--------------------------------------------------------------------------------------------------
-/*		ESSA ÁREA PODE SER IGNORADA AGORA, VAI SER ADIANTE PARA IMPLEMENTAR UM OBSERVADOR DE LUENBERGER
-			 erroia = ia - iach;
-
-			 diach = (1.0f / L_PHASE) * (va - R_PHASE * iach - each) + (L_GAIN_1 * erroia);
-			 deach = L_GAIN_2 * erroia;
-
-			 erroib = ib - ibch;
-			 dibch = (1.0f / L_PHASE) * (vb - R_PHASE * ibch - ebch) + (L_GAIN_1 * erroib);
-			 debch = L_GAIN_2 * erroib;
-
-			 iach = iach + (diach * Ts);
-			 ibch = ibch + (dibch * Ts);
-			 each = each + (deach * Ts);
-			 ebch = ebch + (debch * Ts);
-
-			 thetach = atan2f(ebch, each);
-*/
-
-
-
-
-
+	 while (1)
+	 {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+		 if(flagdadosprontos>=2){
+
+			Fast_Loop();
+
+			 // 2. CLARKE TRANSFORM (Obtemos Ia e Ib no estator)
+			 ia = (TWO_DIV_3 * iu) - (TWO_DIV_3/2.0f * iv) - (TWO_DIV_3/2.0f * iw);
+			 ib = SQRT3_DIV_3 * (iv - iw);
+
+
+			 // =========================================================
+			 // BLOCO DO OBSERVADOR (RODA SEMPRE, INDEPENDENTE DO ESTADO)
+			 // =========================================================
+
+			 // --- PASSO 1: FILTRO ALPHA-BETA ---
+			 // Eixo Alpha
+			 float ia_pred = i_alpha_est + (di_alpha_est * Ts);
+			 float res_a   = ia - ia_pred;
+			 i_alpha_est   = ia_pred + (ALPHA * res_a);
+			 di_alpha_est  = di_alpha_est + ((BETA/Ts) * res_a);
+
+			 // Eixo Beta
+			 float ib_pred = i_beta_est + (di_beta_est * Ts);
+			 float res_b   = ib - ib_pred;
+			 i_beta_est    = ib_pred + (ALPHA * res_b);
+			 di_beta_est   = di_beta_est + ((BETA/Ts) * res_b);
+
+			 // --- PASSO 2: ESTIMADOR DE BEMF ---
+
+			 float e_alpha = valpha_prev - (R * i_alpha_est) - (L * di_alpha_est);
+			 float e_beta  = vbeta_prev  - (R * i_beta_est)  - (L * di_beta_est);
+
+			 // --- PASSO 3: PLL (Rastreamento de Ângulo) ---
+			 float32_t sin_pll, cos_pll;
+			 sin_pll = arm_sin_f32(pll_theta);
+			 cos_pll = arm_cos_f32(pll_theta);
+
+
+			 float error_pll = (e_alpha * cos_pll) + (e_beta * sin_pll);
+
+			 pll_integrator += error_pll * PLL_KI * Ts;
+			 pll_omega = (error_pll * PLL_KP) + pll_integrator;
+
+			 pll_theta += pll_omega * Ts;
+
+			 // Normalização Theta PLL
+			 if (pll_theta > (2.0f * PI)) pll_theta -= (2.0f * PI);
+			 else if (pll_theta < 0.0f)   pll_theta += (2.0f * PI);
+
+			 // --- PASSO 4: SAÍDA DO FOC (Theta Compensado) ---
+			 float theta_foc = pll_theta + (pll_omega * Ts * 1.5f);
+
+			 // Normalização Theta FOC
+			 if (theta_foc > (2.0f * PI)) theta_foc -= (2.0f * PI);
+			 else if (theta_foc < 0.0f)   theta_foc += (2.0f * PI);
+
+
+			 // =========================================================
+			 // MÁQUINA DE ESTADOS
+			 // =========================================================
+
+			 if(vbus < 12) // ESTADO 1: FALHA / BAIXA TENSÃO
+			 {
+				 TIM1->CCR1 = ((TIM1->ARR)/2);
+				 TIM1->CCR2 = ((TIM1->ARR)/2);
+				 TIM1->CCR3 = ((TIM1->ARR)/2);
+
+				 init = 1;
+				 // Zera variáveis do observador para evitar loucura na volta
+				 pll_integrator = 0; pll_theta = 0; pll_omega = 0;
+				 w=0;
+			 }
+			 else if(vbus > 12 && init == 1) // ESTADO 2: ALINHAMENTO
+			 {
+				 init = 0;
+				 va = 0.1f * vbus; vb = 0.0f; // Vetor fixo
+				 // ... (Cálculo do PWM mantido) ...
+				 vu = va;
+				 vv = (-0.5f * va);
+				 vw = (-0.5f * va);
+				 // Atualiza PWM...
+				 TIM1->CCR1 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vu / vbus));
+				 TIM1->CCR2 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vv / vbus));
+				 TIM1->CCR3 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vw / vbus));
+
+
+				 HAL_Delay(2000);
+				 // Define ângulo inicial do PLL igual ao alinhamento (0 graus)
+				 pll_theta = 0;
+			 }
+
+			 //--------------------------------------
+			 // ----ESTADO 3: RAMPA (MALHA ABERTA)---
+
+			 else if(vbus > 12 && init != 1 && observador!=2)
+			 {
+				 // 1. Aceleração
+				 if (w < 450.0f) { w = w + 1*Ts; }
+				 wref = w;
+
+				 // 2. Integração do Ângulo
+				 dtheta = w*Ts;
+				 theta = theta + dtheta;
+
+				 if (theta > TWO_PI){ theta = theta - TWO_PI;}
+
+
+				 // 5. Transição para Sensorless
+				 if(w > 440.0f)
+				 {
+					 observador=2;
+					 serrow = 0.0f; serroiq = 0.0f; serroid = 0.0f;
+
+					 // Sincroniza o PLL
+					 pll_integrator = w;
+					 // Opcional: forçar o ângulo do PLL ser igual ao da rampa para evitar tranco
+					 pll_theta = theta;
+				 }
+
+
+				 // 4. Geração dos Vetores (USANDO INVERSA DE PARK COMO ANTES)
+				 float32_t sin_ramp, cos_ramp;
+
+				 sin_ramp = arm_sin_f32(theta);
+				 cos_ramp = arm_cos_f32(theta);
+				 arm_inv_park_f32(0, (2*0.7*vbus/8 + 6*vbus*w/(8*450)), &va, &vb, sin_ramp, cos_ramp);
+
+				 // 6. Atualiza PWM
+				 vu = va;
+				 vv = (-0.5f * va) + (SQRT3_DIV_2 * vb);
+				 vw = (-0.5f * va) - (SQRT3_DIV_2 * vb);
+				 TIM1->CCR1 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vu / vbus));
+				 TIM1->CCR2 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vv / vbus));
+				 TIM1->CCR3 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vw / vbus));
+
+			 }
+
+			 //--------------------------------------------------------
+			 // ESTADO 4: CONTROLO FOC "SENSORLESS" (MALHA FECHADA)----
+			 //--------------------------------------------------------
+
+			 else if(vbus > 12 && init != 1 && observador!=0) // (observador==2)
+			 {
+				 // 1. FEEDBACK DE VELOCIDADE (Vem do PLL)
+				 w = pll_omega;
+
+				 // 2. PARK TRANSFORM (Calcula Id e Iq atuais)
+				 float32_t sin_foc, cos_foc;
+
+				 sin_foc = arm_sin_f32(theta_foc);
+				 cos_foc = arm_cos_f32(theta_foc);
+
+
+				 id = (i_alpha_est * cos_foc) + (i_beta_est * sin_foc);
+				 iq = (i_beta_est * cos_foc) - (i_alpha_est * sin_foc);
+
+
+				 // --- 3. CONTROLADOR DE VELOCIDADE ---
+				 errow = wref - w;
+				 serrow = serrow + errow*Ts;
+
+				 // Anti-Windup Velocidade (Seu código original)
+
+				 if(kiw > 0.00001f) {
+					 float SERROW_MAX_VAL = 3.0f / kiw;
+					 float SERROW_MIN_VAL = -3.0f / kiw;
+					 if (serrow > SERROW_MAX_VAL) serrow = SERROW_MAX_VAL;
+					 else if (serrow < SERROW_MIN_VAL) serrow = SERROW_MIN_VAL;
+				 }
+
+				 iqref = kpw*errow + kiw*serrow;
+
+				 // Saturação da Corrente de Referência (Limite de 3.0A)
+				 if (iqref < -3.0f) iqref = -3.0f;
+				 else if (iqref > 3.0f) iqref = 3.0f;
+
+
+				 // --- 4. CÁLCULO DO LIMITE DE TENSÃO (SVPWM) ---
+				 float v_limite = vbus * SQRT3_DIV_3; // Max tensão disponível no vetor
+
+
+				 // --- 5. CONTROLADOR DE CORRENTE Q ---
+				 erroiq = iqref - iq;
+				 serroiq = serroiq + erroiq*Ts;
+
+				 // Anti-Windup IQ (Dinâmico baseada no Vbus)
+				 if(kiq > 0.00001f) {
+					 float SERRQ_MAX_VAL = v_limite / kiq;
+					 float SERRQ_MIN_VAL = -v_limite / kiq;
+					 if (serroiq > SERRQ_MAX_VAL) serroiq = SERRQ_MAX_VAL;
+					 else if (serroiq < SERRQ_MIN_VAL) serroiq = SERRQ_MIN_VAL;
+				 }
+
+				 vq = kpq*erroiq + kiq*serroiq;
+
+				 // Saturação da Tensão Q
+				 if (vq > v_limite) vq = v_limite;
+				 else if (vq < -v_limite) vq = -v_limite;
+
+				 // --- 6. CONTROLADOR DE CORRENTE D ---
+				 erroid = 0.0f - id; // IdRef é 0
+				 serroid = serroid + erroid*Ts;
+
+				 // Anti-Windup ID
+				 if(kid > 0.00001f) {
+					 float SERRD_MAX_VAL = v_limite / kid;
+					 float SERRD_MIN_VAL = -v_limite / kid;
+					 if (serroid > SERRD_MAX_VAL) serroid = SERRD_MAX_VAL;
+					 else if (serroid < SERRD_MIN_VAL) serroid = SERRD_MIN_VAL;
+				 }
+
+				 vd = kpd*erroid + kid*serroid;
+
+				 // Saturação da Tensão D
+				 if (vd > v_limite) vd = v_limite;
+				 else if (vd < -v_limite) vd = -v_limite;
+
+
+				 // --- 7. INVERSE PARK TRANSFORM ---
+				 arm_inv_park_f32(vd, vq, &va, &vb, sin_foc, cos_foc);
+
+				 // --- 8. ATUALIZAÇÃO DO PWM (SVPWM) ---
+				 vu = va;
+				 vv = (-0.5f * va) + (SQRT3_DIV_2 * vb);
+				 vw = (-0.5f * va) - (SQRT3_DIV_2 * vb);
+
+				 TIM1->CCR1 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vu / vbus));
+				 TIM1->CCR2 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vv / vbus));
+				 TIM1->CCR3 = ((TIM1->ARR)*0.8f / 2) * (1.0f + (vw / vbus));
+
+
+
+
+			 } // fim sensorless
+
+			 // =========================================================
+			 // DEBUG DAC (VISUALIZAÇÃO EM TEMPO REAL)
+			 // =========================================================
+
+			 // --- CANAL 1: THETA ESTIMADO (0 a 3.3V = 0 a 360 graus) ---
+			 // Normaliza de 0..2PI para 0..4095
+			 uint32_t dac_theta_val = (uint32_t)( (theta_foc / (2.0f * PI)) * 4095.0f );
+			 // Proteção simples (caso o theta passe um pouquinho de 2PI por erro numérico)
+			 if (dac_theta_val > 4095) dac_theta_val = 4095;
+			 HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_theta_val);
+			 // --- CANAL 2: CORRENTE ALPHA ESTIMADA (Senoide Centralizada) ---
+			 // O DAC vai oscilar entre 1248 e 2848.
+			 float DAC_GAIN_I = 200.0f;
+			 int32_t dac_current_val = 2048 + (int32_t)(i_alpha_est * DAC_GAIN_I);
+			 // Saturação para não estourar o DAC (0 a 4095)
+			 if (dac_current_val > 4095) dac_current_val = 4095;
+			 else if (dac_current_val < 0) dac_current_val = 0;
+			 HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, (uint32_t)dac_current_val);
+			 // =========================================================
+			 // O estimador de BEMF precisa saber que tensão foi aplicada NESTE ciclo
+			 // para calcular a BEMF no PRÓXIMO ciclo.
+
+			 valpha_prev = va;
+			 vbeta_prev  = vb;
+		 }//Fim do if flag
+		 } // Fim do while
 
   /* USER CODE END 3 */
 }
@@ -710,16 +775,16 @@ static void MX_ADC1_Init(void)
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.GainCompensation = 0;
-  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.OversamplingMode = DISABLE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -742,15 +807,6 @@ static void MX_ADC1_Init(void)
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -790,11 +846,11 @@ static void MX_ADC2_Init(void)
   hadc2.Init.EOCSelection = ADC_EOC_SEQ_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
   hadc2.Init.ContinuousConvMode = DISABLE;
-  hadc2.Init.NbrOfConversion = 4;
+  hadc2.Init.NbrOfConversion = 2;
   hadc2.Init.DiscontinuousConvMode = DISABLE;
-  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc2.Init.DMAContinuousRequests = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
+  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc2.Init.DMAContinuousRequests = ENABLE;
   hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc2.Init.OversamplingMode = DISABLE;
   if (HAL_ADC_Init(&hadc2) != HAL_OK)
@@ -817,26 +873,8 @@ static void MX_ADC2_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_3;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
-  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_5;
-  sConfig.Rank = ADC_REGULAR_RANK_3;
-  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
   sConfig.Channel = ADC_CHANNEL_15;
-  sConfig.Rank = ADC_REGULAR_RANK_4;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -1037,9 +1075,9 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 1;
+  htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
-  htim1.Init.Period = 1000;
+  htim1.Init.Period = 8499;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -1053,10 +1091,6 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1086,8 +1120,8 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1150,8 +1184,10 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PB10 PB3 PB4 PB5
                            PB6 */
@@ -1159,6 +1195,13 @@ static void MX_GPIO_Init(void)
                           |GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PA15 */
@@ -1173,79 +1216,105 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
-{
-  /* A conversão do ADC1 terminou? */
-  if (hadc->Instance == hadc1.Instance)
-  {
-    if(opamp1selector == 0)
-    {
-      // 1. Mude o MUX para a *próxima* leitura (PA7)
-      MODIFY_REG(hopamp1.Instance->CSR, OPAMP_CSR_VPSEL, OPAMP_NONINVERTINGINPUT_IO2);
 
-      // 2. Salve os dados da leitura que *acabou de terminar* (de PA1)
-      iw_raw = adc1_buffer[0];
-      vu_raw = adc1_buffer[1];
+CCM_FUNC void Fast_Loop(void) {
 
-      // 3. Atualize o estado
-      opamp1selector = 1;
-    }
-    else
-    {
-      // 1. Mude o MUX de volta para a *próxima* leitura (PA1)
-      MODIFY_REG(hopamp1.Instance->CSR, OPAMP_CSR_VPSEL, OPAMP_NONINVERTINGINPUT_IO0);
+    // ZONA CRÍTICA
+    __disable_irq();
+    flagdadosprontos = 0;
 
-      // 2. Salve os dados da leitura que *acabou de terminar* (de PA7)
-      iu_raw_op1 = adc1_buffer[0];
-      vu_raw = adc1_buffer[1]; // Você está lendo vu_raw nos dois casos, ok
+    // Captura snapshots (Cópia rápida)
+    // Nota: iv_raw está na RAM lenta, mas a leitura é única e rápida.
+    float raw_v = (float)iv_raw;
+    float raw_w = (float)iw_raw;
+    float raw_bus = (float)vbus_raw;
+    __enable_irq();
 
-      // 3. Atualize o estado
-      opamp1selector = 0;
-    }
+    // O processamento pesado acontece agora usando dados e código na CCMRAM
 
-    // 4. Inicie a próxima etapa da cadeia: ADC2
-    HAL_ADC_Start_DMA(&hadc2, adc2_buffer, 4);
-  }
+    // 1. Filtros
+    float iv_filtrada = Processar_Filtro(&filtro_iv, raw_v);
+    float iw_filtrada = Processar_Filtro(&filtro_iw, raw_w);
 
-  /* A conversão do ADC2 terminou? */
-  if (hadc->Instance == hadc2.Instance)
-  {
-    if(opamp2selector == 0)
-    {
-      // 1. Mude o MUX para a *próxima* leitura (PB0)
-      MODIFY_REG(hopamp2.Instance->CSR, OPAMP_CSR_VPSEL, OPAMP_NONINVERTINGINPUT_IO2);
+    // 2. Conversão Física
+    iv = -1.0f * (iv_filtrada - offset_iv_raw) * (3.3f / 4095.0f) / 0.02f;
+    iw = -1.0f * (iw_filtrada - offset_iw_raw) * (3.3f / 4095.0f) / 0.02f;
 
-      // 2. Salve os dados da leitura que *acabou de terminar* (de PB14)
-      iv_raw = adc2_buffer[0];
-      vv_raw = adc2_buffer[1];
-      vw_raw = adc2_buffer[2];
-      vbus_raw = adc2_buffer[3];
+    // 3. Kirchhoff e Vbus
+    iu = -iv - iw;
+    vbus = (raw_bus * (3.3f / 4095.0f)) * 21.6f;
 
-      // 3. Atualize o estado
-      opamp2selector = 1;
-    }
-    else
-    {
-      // 1. Mude o MUX de volta para a *próxima* leitura (PB14)
-      MODIFY_REG(hopamp2.Instance->CSR, OPAMP_CSR_VPSEL, OPAMP_NONINVERTINGINPUT_IO1);
-
-      // 2. Salve os dados da leitura que *acabou de terminar* (de PB0)
-      iu_raw_op2 = adc2_buffer[0];
-      vv_raw = adc2_buffer[1]; // Cuidado, sobrescrevendo vv_raw
-      vw_raw = adc2_buffer[2]; // Cuidado, sobrescrevendo vw_raw
-      vbus_raw = adc2_buffer[3]; // Cuidado, sobrescrevendo vbus_raw
-
-      // 3. Atualize o estado
-      opamp2selector = 0;
-
-      // 4. FIM DA CADEIA! Avise o main loop e resete o timer.
-      flagdadosprontos = 1;
-      // Sua nova lógica
-    }
-itcounter=0;
-  }
 
 }
+
+
+// --- Configura os coeficientes para 250Hz ---
+CCM_FUNC void Inicializar_Filtros(void) {
+    // --- COEFICIENTES DE 1ª ORDEM (Bessel/Butterworth) ---
+
+    // Numerador (Entrada)
+    float B0 = 0.30926852f;
+    float B1 = 0.30926852f;
+    float B2 = 0.0f; // Zero (Filtro de 1ª ordem não tem z^-2)
+
+    // Denominador (Saída/Feedback)
+    // ATENÇÃO: Invertemos o sinal de A1 para negativo para manter o ganho unitário
+    // na fórmula de subtração: saida = ... - (a1 * y1)
+    float A1 = -0.38146295f;
+    float A2 =  0.0f; // Zero
+
+    // --- Configuração FASE V ---
+    filtro_iv.b0 = B0; filtro_iv.b1 = B1; filtro_iv.b2 = B2;
+    filtro_iv.a1 = A1; filtro_iv.a2 = A2;
+
+    // Zera memória
+    filtro_iv.x1 = 0; filtro_iv.x2 = 0;
+    filtro_iv.y1 = 0; filtro_iv.y2 = 0;
+
+    // --- Configuração FASE W ---
+    filtro_iw = filtro_iv; // Copia tudo
+}
+
+// Mantém a função de processamento igual (ela funciona para 1ª e 2ª ordem)
+CCM_FUNC float Processar_Filtro(EstruturaFiltro *f, float entrada) {
+    float saida = (f->b0 * entrada) + (f->b1 * f->x1) + (f->b2 * f->x2)
+                - (f->a1 * f->y1) - (f->a2 * f->y2);
+
+    f->x2 = f->x1;
+    f->x1 = entrada;
+
+    f->y2 = f->y1;
+    f->y1 = saida;
+
+    return saida;
+}
+
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+
+
+
+  if (hadc->Instance == hadc1.Instance)
+  {
+
+	  GPIOB->ODR ^= GPIO_PIN_12;
+      iw_raw = adc1_buffer[0];
+
+      flagdadosprontos++;
+  }
+
+
+  if (hadc->Instance == hadc2.Instance)
+  {
+	  GPIOB->ODR ^= GPIO_PIN_12;
+      iv_raw = adc2_buffer[0];
+      vbus_raw = adc2_buffer[1];
+      flagdadosprontos++;
+  }
+  }
+
+
 /* USER CODE END 4 */
 
 /**
